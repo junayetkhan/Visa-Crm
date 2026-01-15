@@ -42,6 +42,7 @@ function vms_install_tables() {
         total_fee decimal(15,2) DEFAULT '0.00',
         paid_fee decimal(15,2) DEFAULT '0.00',
         due_fee decimal(15,2) DEFAULT '0.00',
+        costing decimal(15,2) DEFAULT '0.00',
         current_step int(2) DEFAULT 1,
         step_name varchar(200) DEFAULT 'Application Submitted',
         status varchar(50) DEFAULT 'pending',
@@ -108,23 +109,7 @@ function vms_install_tables() {
     ) $charset_collate;";
     dbDelta($sql_sms);
     
-    // 4. Activity logs table
-    $table_activity = $wpdb->prefix . 'vms_activity_logs';
-    $sql_activity = "CREATE TABLE IF NOT EXISTS $table_activity (
-        id bigint(20) NOT NULL AUTO_INCREMENT,
-        user_id bigint(20) DEFAULT NULL,
-        user_name varchar(200) DEFAULT '',
-        action varchar(200) NOT NULL,
-        details text,
-        ip_address varchar(50) DEFAULT '',
-        user_agent text,
-        created_at datetime DEFAULT CURRENT_TIMESTAMP,
-        PRIMARY KEY (id),
-        KEY idx_user (user_id),
-        KEY idx_action (action),
-        KEY idx_date (created_at)
-    ) $charset_collate;";
-    dbDelta($sql_activity);
+    
     
     // 5. Settings table
     $table_settings = $wpdb->prefix . 'vms_settings';
@@ -195,27 +180,29 @@ function vms_install_tables() {
     }
     
     // Log installation
-    vms_log_activity($admin_id, 'SYSTEM_INSTALL', 'Visa Management System installed successfully');
+    
+}
+
+// ==================== DATABASE UPDATE CHECK ====================
+add_action('admin_init', 'vms_check_database_updates');
+function vms_check_database_updates() {
+    global $wpdb;
+    $table_clients = $wpdb->prefix . 'vms_clients';
+    
+    // Check if costing column exists
+    $column = $wpdb->get_results($wpdb->prepare(
+        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+        WHERE TABLE_NAME = %s AND COLUMN_NAME = 'costing'",
+        $table_clients
+    ));
+
+    if (empty($column)) {
+        $wpdb->query("ALTER TABLE $table_clients ADD costing decimal(15,2) DEFAULT '0.00' AFTER due_fee");
+    }
 }
 
 // ==================== CORE FUNCTIONS ====================
-function vms_log_activity($user_id, $action, $details = '') {
-    global $wpdb;
-    $table = $wpdb->prefix . 'vms_activity_logs';
-    
-    $user = get_userdata($user_id);
-    
-    $data = [
-        'user_id' => $user_id,
-        'user_name' => $user ? $user->display_name : 'System',
-        'action' => $action,
-        'details' => $details,
-        'ip_address' => $_SERVER['REMOTE_ADDR'] ?? '',
-        'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? ''
-    ];
-    
-    $wpdb->insert($table, $data);
-}
+
 
 function vms_generate_serial() {
     global $wpdb;
@@ -492,14 +479,7 @@ function vms_admin_menu() {
         'vms_export_page'
     );
     
-    add_submenu_page(
-        'vms-dashboard',
-        'Activity Logs',
-        'Activity Logs',
-        $capability,
-        'vms-activity-logs',
-        'vms_activity_logs_page'
-    );
+    
 }
 
 // ==================== DASHBOARD PAGE ====================
@@ -514,13 +494,14 @@ function vms_dashboard_page() {
     $expenses_table = $wpdb->prefix . 'vms_expenses';
     
     $user_id = get_current_user_id();
-    vms_log_activity($user_id, 'VIEW_DASHBOARD', 'Accessed dashboard page');
+    
     
     // Get statistics
     $stats = [
         'total_clients' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE is_deleted = 0"),
-        'total_revenue' => $wpdb->get_var("SELECT SUM(total_fee) FROM $clients_table WHERE is_deleted = 0") ?: 0,
-        'total_collected' => $wpdb->get_var("SELECT SUM(paid_fee) FROM $clients_table WHERE is_deleted = 0") ?: 0,
+        'total_revenue' => $wpdb->get_var("SELECT SUM(amount) FROM $payments_table WHERE status = 'completed'") ?: 0,
+        'total_costing' => $wpdb->get_var("SELECT SUM(costing) FROM $clients_table WHERE is_deleted = 0 AND due_fee <= 0") ?: 0,
+        'total_collected' => $wpdb->get_var("SELECT SUM(amount) FROM $payments_table WHERE status = 'completed'") ?: 0,
         'total_due' => $wpdb->get_var("SELECT SUM(due_fee) FROM $clients_table WHERE is_deleted = 0") ?: 0,
         'pending' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'pending' AND is_deleted = 0"),
         'processing' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'processing' AND is_deleted = 0"),
@@ -535,8 +516,7 @@ function vms_dashboard_page() {
         'today_expenses' => $wpdb->get_var($wpdb->prepare(
             "SELECT SUM(amount) FROM $expenses_table WHERE expense_date = %s",
             date('Y-m-d')
-        )) ?: 0,
-    ];
+        )) ?: 0];
     
     // Recent applications
     $recent_apps = $wpdb->get_results(
@@ -969,7 +949,8 @@ function vms_dashboard_page() {
                             <span>Net Profit</span>
                         </div>
                         <?php 
-                        $net_profit = $stats['total_collected'] - $stats['total_expenses'];
+                        // Net Profit = Total Collected - (General Expenses + Costing of fully paid applications)
+                        $net_profit = $stats['total_collected'] - $stats['total_expenses'] - $stats['total_costing'];
                         $profit_class = $net_profit >= 0 ? 'profit' : 'loss';
                         ?>
                         <div class="financial-value <?php echo esc_attr($profit_class); ?>">
@@ -1729,7 +1710,7 @@ function vms_applications_page() {
                 );
                 
                 if ($result !== false) {
-                    vms_log_activity($user_id, 'DELETE_CLIENT', "Deleted client ID: $client_id");
+                    
                     echo '<div class="notice notice-success is-dismissible"><p>Client deleted successfully!</p></div>';
                 } else {
                     echo '<div class="notice notice-error is-dismissible"><p>Error deleting client: ' . esc_html($wpdb->last_error) . '</p></div>';
@@ -2721,6 +2702,7 @@ function vms_handle_client_form() {
                 'country' => sanitize_text_field($_POST['country']),
                 'total_fee' => floatval($_POST['total_fee']),
                 'paid_fee' => floatval($_POST['paid_fee']),
+                'costing' => floatval($_POST['costing']),
                 'current_step' => intval($_POST['current_step']),
                 'step_name' => sanitize_text_field($_POST['step_name']),
                 'status' => sanitize_text_field($_POST['status']),
@@ -2741,7 +2723,39 @@ function vms_handle_client_form() {
             }
             
             if ($client_id && $client) {
+                // Update client data
                 $result = $wpdb->update($clients_table, $data, ['id' => $client_id]);
+                
+                // Recalculate paid_fee from payments table to ensure consistency
+                $payments_table = $wpdb->prefix . 'vms_payments';
+                $total_paid = $wpdb->get_var($wpdb->prepare(
+                    "SELECT SUM(amount) FROM $payments_table WHERE client_id = %d AND status = 'completed'",
+                    $client_id
+                )) ?: 0;
+                
+                // If the user manually changed paid_fee in the form, record the difference
+                $form_paid = floatval($data['paid_fee']);
+                if ($form_paid != $total_paid) {
+                    $diff = $form_paid - $total_paid;
+                    $wpdb->insert($payments_table, [
+                        'client_id' => $client_id,
+                        'invoice_no' => vms_generate_invoice_no(),
+                        'amount' => $diff,
+                        'payment_date' => current_time('mysql', 0),
+                        'payment_method' => 'cash',
+                        'received_by' => $user_id,
+                        'notes' => 'Adjustment from client form',
+                        'status' => 'completed'
+                    ]);
+                    
+                    // Update client again with correct total
+                    $total_paid = $form_paid;
+                    $wpdb->update($clients_table, [
+                        'paid_fee' => $total_paid,
+                        'due_fee' => floatval($data['total_fee']) - $total_paid
+                    ], ['id' => $client_id]);
+                }
+                
                 $message = 'Client updated successfully!';
                 $action = 'UPDATE_CLIENT';
             } else {
@@ -2757,6 +2771,22 @@ function vms_handle_client_form() {
                 
                 $result = $wpdb->insert($clients_table, $data);
                 $client_id = $wpdb->insert_id;
+                
+                // Record initial payment if any
+                if ($result !== false && floatval($data['paid_fee']) > 0) {
+                    $payments_table = $wpdb->prefix . 'vms_payments';
+                    $wpdb->insert($payments_table, [
+                        'client_id' => $client_id,
+                        'invoice_no' => vms_generate_invoice_no(),
+                        'amount' => floatval($data['paid_fee']),
+                        'payment_date' => current_time('mysql', 0),
+                        'payment_method' => 'cash',
+                        'received_by' => $user_id,
+                        'notes' => 'Initial payment at registration',
+                        'status' => 'completed'
+                    ]);
+                }
+                
                 $message = 'Client added successfully!';
                 $action = 'ADD_CLIENT';
             }
@@ -2786,7 +2816,7 @@ function vms_handle_client_form() {
                 }
             }
             
-            vms_log_activity($user_id, $action, "Client ID: $client_id - " . $data['client_name']);
+            
             
             if (!$client_id && isset($data['serial_no'])) {
                 echo '<div class="notice notice-success"><p>' . esc_html($message) . ' Serial Number: <strong>' . esc_html($data['serial_no']) . '</strong></p></div>';
@@ -2949,7 +2979,14 @@ function vms_handle_client_form() {
                                            class="regular-text" onchange="calculateDue()" required>
                                 </div>
                                 
+                                
                                 <div class="form-group">
+                                    <label for="costing">Costing (Expense) (৳)</label>
+                                    <input type="number" id="costing" name="costing" step="0.01" min="0"
+                                           value="<?php echo $client ? esc_attr($client->costing) : '0'; ?>"
+                                           class="regular-text" onchange="calculateDue()">
+                                </div>
+                                                                <div class="form-group">
                                     <label>Due Amount (৳)</label>
                                     <input type="text" id="due_fee" readonly
                                            value="<?php echo $client ? esc_attr($client->due_fee) : '0'; ?>"
@@ -3765,7 +3802,7 @@ function vms_payment_list() {
                 <div class="stat-content">
                     <div class="stat-number"><?php echo esc_html($wpdb->get_var("SELECT COUNT(*) FROM $payments_table WHERE DATE(payment_date) = CURDATE()")); ?></div>
                     <div class="stat-label">Today's Payments</div>
-                    <div class="stat-footer">Latest activity</div>
+                    <div class="stat-footer">Real-time update</div>
                 </div>
             </div>
             
@@ -5936,7 +5973,7 @@ function vms_handle_sms_form() {
                     
                     $wpdb->insert($sms_table, $data);
                     
-                    vms_log_activity($user_id, 'SEND_SMS', "SMS sent to $phone - Client ID: $client_id");
+                    
                     
                     echo '<div class="notice notice-success"><p>SMS sent successfully!</p></div>';
                 } else {
@@ -6514,7 +6551,7 @@ function vms_enhanced_summary_report() {
         )) ?: 0,
         
         'total_revenue' => $wpdb->get_var($wpdb->prepare(
-            "SELECT SUM(total_fee) FROM $clients_table WHERE is_deleted = 0 AND DATE(created_at) BETWEEN %s AND %s",
+            "SELECT SUM(paid_fee) FROM $clients_table WHERE is_deleted = 0 AND DATE(created_at) BETWEEN %s AND %s",
             $start_date, $end_date
         )) ?: 0,
         
@@ -6530,10 +6567,9 @@ function vms_enhanced_summary_report() {
         
         'pending_applications' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'pending' AND is_deleted = 0") ?: 0,
         'processing_applications' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'processing' AND is_deleted = 0") ?: 0,
-        'completed_applications' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'completed' AND is_deleted = 0") ?: 0,
-    ];
+        'completed_applications' => $wpdb->get_var("SELECT COUNT(*) FROM $clients_table WHERE status = 'completed' AND is_deleted = 0") ?: 0];
     
-    $summary['net_profit'] = $summary['total_collected'] - $summary['total_expenses'];
+    $summary['net_profit'] = $summary['total_collected'] - $summary['total_expenses'] - (isset($summary['total_costing']) ? $summary['total_costing'] : 0);
     
     // Get monthly data for charts
     $monthly_data = [];
@@ -6555,8 +6591,7 @@ function vms_enhanced_summary_report() {
             'collections' => $wpdb->get_var($wpdb->prepare(
                 "SELECT SUM(amount) FROM $payments_table WHERE status = 'completed' AND DATE(payment_date) BETWEEN %s AND %s",
                 $month_start, $month_end
-            )) ?: 0,
-        ];
+            )) ?: 0];
     }
     
     ?>
@@ -10228,7 +10263,7 @@ function vms_settings_page() {
             vms_update_setting($key, $value);
         }
         
-        vms_log_activity($user_id, 'UPDATE_SETTINGS', 'System settings updated');
+        
         
         echo '<div class="notice notice-success is-dismissible"><p>Settings saved successfully!</p></div>';
     }
@@ -10440,9 +10475,7 @@ function vms_settings_page() {
                                     'vms_clients' => 'Clients',
                                     'vms_payments' => 'Payments',
                                     'vms_expenses' => 'Expenses',
-                                    'vms_sms_logs' => 'SMS Logs',
-                                    'vms_activity_logs' => 'Activity Logs'
-                                ];
+                                    'vms_sms_logs' => 'SMS Logs'];
                                 
                                 foreach ($tables as $table => $name) {
                                     $count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}{$table}");
@@ -10892,7 +10925,7 @@ function vms_export_page() {
     }
     
     $user_id = get_current_user_id();
-    vms_log_activity($user_id, 'EXPORT_DATA', "Exported $type data");
+    
     
     switch ($type) {
         case 'applications':
@@ -11230,8 +11263,7 @@ function vms_dashboard_widget_content() {
         'today_payments' => $wpdb->get_var($wpdb->prepare(
             "SELECT SUM(amount) FROM $payments_table WHERE payment_date = %s",
             date('Y-m-d')
-        )) ?: 0,
-    ];
+        )) ?: 0];
     
     ?>
     <div class="vms-dashboard-widget">
@@ -11378,7 +11410,7 @@ function vms_create_backup() {
         'vms_payments',
         'vms_expenses',
         'vms_sms_logs',
-        'vms_activity_logs',
+        
         'vms_settings'
     ];
     
@@ -11713,86 +11745,6 @@ function vms_sms_report() {
     <?php
 }
 
-// ==================== ACTIVITY LOG VIEWER ====================
-function vms_activity_logs_page() {
-    if (!current_user_can('manage_options')) {
-        wp_die('Unauthorized access');
-    }
-    
-    global $wpdb;
-    $table = $wpdb->prefix . 'vms_activity_logs';
-    
-    $per_page = 50;
-    $current_page = isset($_GET['paged']) ? max(1, intval($_GET['paged'])) : 1;
-    $offset = ($current_page - 1) * $per_page;
-    
-    $logs = $wpdb->get_results("
-        SELECT * FROM $table 
-        ORDER BY created_at DESC 
-        LIMIT $per_page OFFSET $offset
-    ");
-    
-    $total = $wpdb->get_var("SELECT COUNT(*) FROM $table");
-    
-    ?>
-    <div class="wrap vms-activity-logs">
-        <h1>Activity Logs</h1>
-        
-        <div class="vms-card">
-            <div class="vms-table-responsive">
-                <table class="wp-list-table widefat fixed striped">
-                    <thead>
-                        <tr>
-                            <th>Date & Time</th>
-                            <th>User</th>
-                            <th>Action</th>
-                            <th>Details</th>
-                            <th>IP Address</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <?php foreach ($logs as $log): ?>
-                        <tr>
-                            <td><?php echo date('M d, Y H:i:s', strtotime($log->created_at)); ?></td>
-                            <td><?php echo esc_html($log->user_name); ?></td>
-                            <td><code><?php echo esc_html($log->action); ?></code></td>
-                            <td><?php echo esc_html($log->details); ?></td>
-                            <td><?php echo esc_html($log->ip_address); ?></td>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
-                </table>
-            </div>
-            
-            <?php if ($total > $per_page): ?>
-                <div class="tablenav">
-                    <div class="tablenav-pages">
-                        <?php
-                        $total_pages = ceil($total / $per_page);
-                        echo paginate_links([
-                            'base' => add_query_arg('paged', '%#%'),
-                            'format' => '',
-                            'prev_text' => '&laquo;',
-                            'next_text' => '&raquo;',
-                            'total' => $total_pages,
-                            'current' => $current_page
-                        ]);
-                        ?>
-                    </div>
-                </div>
-            <?php endif; ?>
-        </div>
-    </div>
-    
-    <style>
-    .vms-activity-logs {
-        max-width: 1600px;
-        margin: 0 auto;
-    }
-    </style>
-    <?php
-}
-
 // ==================== NOTIFICATION SYSTEM ====================
 function vms_send_notification($client_id, $type, $data = []) {
     global $wpdb;
@@ -11861,7 +11813,7 @@ function vms_uninstall() {
         'vms_clients',
         'vms_payments',
         'vms_sms_logs',
-        'vms_activity_logs',
+        
         'vms_settings',
         'vms_expenses'
     ];
